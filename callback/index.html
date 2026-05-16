@@ -1,0 +1,205 @@
+<!doctype html>
+<!--
+  Static OAuth callback redirector for connect.securecloudgroup.com/callback.
+
+  Purpose: Google (or another OAuth provider) redirects the user here after
+  consent. This page extracts the operator's Client VM alias from the
+  `state` parameter and HTTP-302s the browser to that VM's
+  /api/client_email/oauth/finalize endpoint, preserving `code` + `state`.
+
+  Threat model: the page sees only the short-lived authorization `code`
+  (not a refresh token). PKCE verifier lives on the Client VM, not here,
+  so even a compromised redirector cannot redeem the code. The page
+  stores nothing — no cookies, no local storage, no analytics.
+
+  State format: `<alias>:<nonce>:<hmac>` — the Client VM constructs this
+  when starting the OAuth flow and validates the HMAC when receiving the
+  finalize callback. This page only needs the alias prefix to know
+  where to redirect; it does NOT validate the HMAC.
+
+  Acceptable aliases: lowercase letters, digits, hyphen, underscore.
+  Same alphabet the provisioning system uses for VM hostnames. Anything
+  else fails closed with an "Invalid state" message — no redirect.
+
+  Error handling: if Google returns `error=<code>` instead of `code=`,
+  surface the error to the operator with a calm message and a link
+  back to the SmartBrain marketing page. Specifically NOT a link
+  into a Client VM, since at this point we don't know which VM to
+  send the operator to (the error could be that consent was denied
+  before any state round-trip).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>SmartBrain — Connecting…</title>
+    <style>
+      :root {
+        color-scheme: dark light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: #0a0a14;
+        color: #e6e6f0;
+      }
+      .card {
+        max-width: 420px;
+        width: 100%;
+        padding: 32px;
+        background: #15151f;
+        border: 1px solid #2a2a3a;
+        border-radius: 12px;
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 18px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      p {
+        margin: 0 0 16px;
+        color: #b0b0c5;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+      a {
+        color: #9b8cff;
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+      }
+      a:hover {
+        border-bottom-color: #9b8cff;
+      }
+      .error h1 {
+        color: #fb7185;
+      }
+      code {
+        background: #20202d;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.85em;
+      }
+      @media (prefers-color-scheme: light) {
+        body { background: #f5f5fa; color: #15151f; }
+        .card { background: #ffffff; border-color: #d8d8e3; }
+        p { color: #555570; }
+        code { background: #eeeef5; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card" id="card">
+      <h1 id="title">Connecting your account…</h1>
+      <p id="body">
+        Sending you back to SmartBrain. If this page doesn't redirect
+        within a few seconds, your browser may be blocking the script.
+      </p>
+    </main>
+
+    <script>
+      (function () {
+        "use strict";
+
+        // Aliases match the provisioning regex: lowercase, digits,
+        // hyphen, underscore. 1-63 chars (DNS label limit).
+        var ALIAS_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+        var BASE_DOMAIN = "securecloudgroup.com";
+        var MARKETING_URL = "https://" + BASE_DOMAIN;
+
+        function showError(title, body) {
+          document.body.querySelector(".card").classList.add("error");
+          document.getElementById("title").textContent = title;
+          document.getElementById("body").innerHTML = body;
+        }
+
+        var params = new URLSearchParams(window.location.search);
+        var code = params.get("code");
+        var state = params.get("state");
+        var oauthError = params.get("error");
+
+        // Case 1: provider returned an error before we ever round-tripped.
+        // We don't know which Client VM to send the operator to — we never
+        // had a valid state. Show a calm explanation + link to marketing.
+        if (oauthError) {
+          var reason =
+            oauthError === "access_denied"
+              ? "You declined the permission grant. Your mail is untouched."
+              : "The provider returned: <code>" +
+                String(oauthError).replace(/[<>]/g, "") +
+                "</code>";
+          showError(
+            "Connection cancelled",
+            reason +
+              "<br /><br />" +
+              '<a href="' + MARKETING_URL + '">Return to SmartBrain</a>'
+          );
+          return;
+        }
+
+        // Case 2: missing required params. Indicates a stale or
+        // malformed callback URL (operator hit the page directly,
+        // or the link expired). No usable state — bounce home.
+        if (!code || !state) {
+          showError(
+            "Nothing to do here",
+            "This page is the OAuth callback for SmartBrain. " +
+              "It needs a valid <code>code</code> and <code>state</code> " +
+              "to do its job.<br /><br />" +
+              '<a href="' + MARKETING_URL + '">Return to SmartBrain</a>'
+          );
+          return;
+        }
+
+        // Case 3: state isn't shaped as <alias>:<nonce>:<hmac>.
+        // Means the Client VM that initiated the flow constructed an
+        // invalid state — bug, not an attack (an attacker can't forge
+        // anything past this point without the HMAC). We still fail
+        // closed.
+        var parts = state.split(":");
+        if (parts.length < 3) {
+          showError(
+            "Invalid state",
+            "The state parameter is missing or malformed. " +
+              "Try the connect flow again from SmartBrain.<br /><br />" +
+              '<a href="' + MARKETING_URL + '">Return to SmartBrain</a>'
+          );
+          return;
+        }
+
+        var alias = parts[0];
+        if (!ALIAS_RE.test(alias)) {
+          showError(
+            "Invalid state",
+            "The state parameter references an alias that doesn't look " +
+              "valid. Try the connect flow again from SmartBrain.<br /><br />" +
+              '<a href="' + MARKETING_URL + '">Return to SmartBrain</a>'
+          );
+          return;
+        }
+
+        // Forward to the operator's own Client VM. The VM does the
+        // PKCE-verifier-bound token exchange (which we can't do here
+        // even if we wanted to — verifier never leaves the VM).
+        //
+        // We pass through the entire original query string so the VM
+        // sees every parameter the provider sent — code, state,
+        // scope, prompt, anything. Belt-and-braces in case the
+        // provider adds new params over time.
+        var target =
+          "https://" + alias + "." + BASE_DOMAIN +
+          "/api/client_email/oauth/finalize" +
+          window.location.search;
+        window.location.replace(target);
+      })();
+    </script>
+  </body>
+</html>
